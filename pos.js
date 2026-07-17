@@ -187,133 +187,214 @@ cli({
         }
         await page.evaluate(function() { return new Promise(function(r) { setTimeout(r, 5000); }); });
 
-        // 4. 分段滚动捕获所有持仓（虚拟滚动只渲染可见行，需逐段收集去重）
-        var allRows = await page.evaluate(async function() {
-            var seenCodes = {};
-            var allResults = [];
-            var viewportH = window.innerHeight;
-            var maxScroll = document.body.scrollHeight;
-            for (var step = 0; step < 50; step++) {
-                window.scrollTo(0, step * viewportH * 0.8);
-                await new Promise(function(r) { setTimeout(r, 400); });
-                // 从当前 body 文本提取可见的股票行
-                var docText = document.body.innerText;
-                var idx = docText.indexOf("明细");
-                if (idx < 0) continue;
-                var lines = docText.substring(idx).split("\n").map(function(l){return l.trim()}).filter(Boolean);
-                var dataStart = 0;
-                for (var s = 0; s < lines.length; s++) {
-                    if (/^\d{6}/.test(lines[s])) { dataStart = s; break; }
-                }
-                if (dataStart === 0) continue;
-                var dataPart = lines.slice(dataStart);
-                var pos = 0;
-                while (pos < dataPart.length) {
-                    var ln = dataPart[pos];
-                    if (/^\d{6}/.test(ln)) {
-                        var code = ln;
-                        if (!seenCodes[code]) {
-                            seenCodes[code] = true;
-                            var stock = dataPart.slice(pos, pos + 25);
-                            if (stock.length >= 18) allResults.push(stock);
-                        }
-                        pos += 25;
-                    } else if (ln === '汇总') {
-                        var sumRow = dataPart.slice(pos, pos + 10);
-                        allResults.push(sumRow);
-                        pos = dataPart.length;
-                        break;
-                    } else {
-                        pos++;
+        // 4. 等待 SPA 调用 stock_position API，直接获取结构化数据
+            var apiData = null;
+        try {
+            var resp = await page.waitForResponse(function(r) {
+                return r.url().includes('stock_position');
+            }, { timeout: 15000 });
+            var json = await resp.json();
+            apiData = json.ex_data;
+        } catch (e) {
+        }
+
+        // 5. 解析数据：优先 API，降级走 DOM 文本
+        var positions = [];
+        var summaryValues = null;
+
+        if (apiData && apiData.position && apiData.position.length > 0) {
+            positions = apiData.position;
+            // 从各持仓汇总计算行
+            var sumValue = 0, sumDp = 0, sumHp = 0;
+            for (var pi = 0; pi < positions.length; pi++) {
+                sumValue += parseFloat(positions[pi].value) || 0;
+                sumDp += parseFloat(positions[pi].pre_profit) || 0;
+                sumHp += parseFloat(positions[pi].hold_profit) || 0;
+            }
+            var dpRate = sumValue > 0 ? (sumDp / sumValue * 100).toFixed(2) + '%' : '--';
+            var hpRate = sumValue > 0 ? (sumHp / sumValue * 100).toFixed(2) + '%' : '--';
+            summaryValues = {
+                value: String(sumValue),
+                dp: String(sumDp),
+                dpr: dpRate,
+                hp: String(sumHp),
+                hpr: hpRate,
+                rate: apiData.position_rate,
+            };
+        } else {
+            // 降级：从 DOM 文本解析（分段滚动捕获）
+            var allRows = await page.evaluate(async function() {
+                var seenCodes = {};
+                var allResults = [];
+                var viewportH = window.innerHeight;
+                var maxScroll = document.body.scrollHeight;
+                for (var step = 0; step < 50; step++) {
+                    window.scrollTo(0, step * viewportH * 0.8);
+                    await new Promise(function(r) { setTimeout(r, 400); });
+                    var docText = document.body.innerText;
+                    var idx = docText.indexOf("明细");
+                    if (idx < 0) continue;
+                    var lines = docText.substring(idx).split("\n").map(function(l){return l.trim()}).filter(Boolean);
+                    var dataStart = 0;
+                    for (var s = 0; s < lines.length; s++) {
+                        if (/^\d{6}/.test(lines[s])) { dataStart = s; break; }
                     }
+                    if (dataStart === 0) continue;
+                    var dataPart = lines.slice(dataStart);
+                    var pos = 0;
+                    while (pos < dataPart.length) {
+                        var ln = dataPart[pos];
+                        if (/^\d{6}/.test(ln)) {
+                            var code = ln;
+                            if (!seenCodes[code]) {
+                                seenCodes[code] = true;
+                                var stock = dataPart.slice(pos, pos + 25);
+                                if (stock.length >= 18) allResults.push(stock);
+                            }
+                            pos += 25;
+                        } else if (ln === '汇总') {
+                            var sumRow = dataPart.slice(pos, pos + 10);
+                            allResults.push(sumRow);
+                            pos = dataPart.length;
+                            break;
+                        } else {
+                            pos++;
+                        }
+                    }
+                    if (step * viewportH * 0.8 >= maxScroll) break;
                 }
-                if (step * viewportH * 0.8 >= maxScroll) break;
+                window.scrollTo(0, 0);
+                return allResults;
+            });
+
+            if (!allRows || allRows.length < 2) {
+                throw new EmptyResultError('tzzb pos', '未获取到持仓数据');
             }
-            window.scrollTo(0, 0);
-            return allResults;
-        });
 
-        // 5. 使用逐段收集的完整持仓数据
-        var rows = allRows;
+            var dataRows = allRows.filter(function(r) { return /^\d{6}/.test(r[0]); });
+            if (dataRows.length === 0) {
+                throw new EmptyResultError('tzzb pos', '表格中无股票持仓记录，账户可能为空仓');
+            }
 
-        if (!rows || rows.length < 2) {
-            throw new EmptyResultError('tzzb pos', '未获取到持仓数据');
+            // 提取汇总行
+            for (var ri = 0; ri < allRows.length; ri++) {
+                if (allRows[ri][0] === '汇总') { summaryValues = allRows[ri]; break; }
+            }
+
+            // 将 DOM 解析结果转为统一格式
+            positions = dataRows.map(function(r) {
+                return {
+                    code: r[0],
+                    name: r[1],
+                    value: r[2],
+                    pre_profit: r[3],
+                    pre_rate: r[4],
+                    hold_profit: r[5],
+                    hold_rate: r[6],
+                    position_rate: r[12] || '0',
+                    hold_days: r[14],
+                    price: r[17],
+                    cost: r[18],
+                };
+            });
+            // 降级模式下也从各持仓汇总计算，不使用 DOM 汇总行的索引映射
+            var fallbackSv = 0, fallbackDp = 0, fallbackHp = 0;
+            for (var fi = 0; fi < positions.length; fi++) {
+                fallbackSv += parseFloat(positions[fi].value) || 0;
+                fallbackDp += parseFloat(positions[fi].pre_profit) || 0;
+                fallbackHp += parseFloat(positions[fi].hold_profit) || 0;
+            }
+            var fbDpRate = fallbackSv > 0 ? (fallbackDp / fallbackSv * 100).toFixed(2) + '%' : '--';
+            var fbHpRate = fallbackSv > 0 ? (fallbackHp / fallbackSv * 100).toFixed(2) + '%' : '--';
+            var totalRate = 0;
+            for (var fi2 = 0; fi2 < positions.length; fi2++) {
+                totalRate += parseFloat(positions[fi2].position_rate) || 0;
+            }
+            summaryValues = {
+                value: String(fallbackSv),
+                dp: String(fallbackDp),
+                dpr: fbDpRate,
+                hp: String(fallbackHp),
+                hpr: fbHpRate,
+                rate: totalRate > 0 ? totalRate.toFixed(2) + '%' : '--',
+            };
         }
 
-        var dataRows = rows.filter(function(r) { return /^\d{6}/.test(r[0]); });
-        if (dataRows.length === 0) {
-            throw new EmptyResultError('tzzb pos', '表格中无股票持仓记录，账户可能为空仓');
+        // 6. 构建输出行
+        // API 字段映射到 fieldDefs 所需位置
+        function getField(p, field) {
+            switch (field) {
+                case 'code':  return p.code || '--';
+                case 'name':  return p.name || '--';
+                case 'value': return fmtNumRaw(p.value);
+                case 'dp':    return fmtNum(p.pre_profit);
+                case 'dpr':   return p.pre_rate || '--';
+                case 'hp':    return fmtNum(p.hold_profit);
+                case 'hpr':   return p.hold_rate || '--';
+                case 'hr':    return p.position_rate || '--';
+                case 'hd':    return p.hold_days || '--';
+                case 'cost':  return fmtNumRaw(p.cost);
+                case 'price': return fmtNumRaw(p.price);
+                default:      return '--';
+            }
         }
 
-        // 提取汇总行
-        var summaryRow = null;
-        for (var ri = 0; ri < rows.length; ri++) {
-            if (rows[ri][0] === '汇总') { summaryRow = rows[ri]; break; }
-        }
-
-        // 汇总字段映射（新页面结构）
-        var summaryFieldMap = {
-            'code': function() { return '汇总'; },
-            'name': function() { return ''; },
-            'value': function() { return fmtNumRaw(summaryRow[1]); },
-            'dp': function() { return mergeProfit(summaryRow[2], summaryRow[3]); },
-            'dpr': function() { return summaryRow[3] || '--'; },
-            'hp': function() { return mergeProfit(summaryRow[4], summaryRow[5]); },
-            'hpr': function() { return summaryRow[5] || '--'; },
-            'hr': function() { return summaryRow[8] || '--'; },
-            'hd': function() { return '--'; },
-            'cost': function() { return '--'; },
-            'price': function() { return '--'; },
-        };
-
-        // 构建汇总行（根据 data 字段动态构建）
-        const summary = summaryRow ? (() => {
-            const obj = {};
-            for (const field of dataFields) {
-                const fn = summaryFieldMap[field.trim()];
-                if (fn) {
-                    const def = fieldDefs[field.trim()];
-                    obj[def.label] = fn();
+        // 汇总行
+        const summaryObj = {};
+        for (const field of dataFields) {
+            const def = fieldDefs[field.trim()];
+            if (def) {
+                var sv = '--';
+                if (summaryValues) {
+                    if (field.trim() === 'code') sv = '汇总';
+                    else if (field.trim() === 'name') sv = '';
+                    else if (field.trim() === 'value') sv = fmtNumRaw(summaryValues.value);
+                    else if (field.trim() === 'dp') sv = mergeProfit(summaryValues.dp, summaryValues.dpr);
+                    else if (field.trim() === 'dpr') sv = summaryValues.dpr || '--';
+                    else if (field.trim() === 'hp') sv = fmtNum(summaryValues.hp);
+                    else if (field.trim() === 'hpr') sv = summaryValues.hpr || '--';
+                    else if (field.trim() === 'hr') sv = summaryValues.rate || '--';
+                    else if (field.trim() === 'hd') sv = '--';
+                    else if (field.trim() === 'cost') sv = '--';
+                    else if (field.trim() === 'price') sv = '--';
+                    else sv = '--';
                 }
+                summaryObj[def.label] = sv;
             }
-            return obj;
-        })() : null;
+        }
 
-        // 构建股票行（根据 data 字段动态构建）
-        const stockRows = dataRows.map(r => {
+        // 股票行
+        const stockRows = positions.map(function(p) {
             const row = {};
             for (const field of dataFields) {
                 const def = fieldDefs[field.trim()];
                 if (def) {
-                    row[def.label] = def.extract(r);
+                    row[def.label] = getField(p, field.trim());
                 }
             }
             return row;
         });
 
-        // 排序：根据排序字段提取数值
-        const extractNum = (field, row) => {
-            // field 是中文列名，找到对应的字段标识
-            const fieldKey = Object.keys(fieldDefs).find(k => fieldDefs[k].label === field);
+        // 排序
+        const extractNum = function(field, row) {
+            const fieldKey = Object.keys(fieldDefs).find(function(k) { return fieldDefs[k].label === field; });
             if (!fieldKey) return 0;
             const val = row[field];
             if (!val || val === '--') return 0;
-            // 对于盈亏金额字段，取括号前的数字
             if (fieldKey === 'dp' || fieldKey === 'hp') {
-                const numPart = val.split('(')[0];
+                const numPart = String(val).split('(')[0];
                 return parseFloat(numPart.replace(/[+%]/g, '')) || 0;
             }
-            // 其他字段直接取数值
-            return parseFloat(val.replace(/[+%]/g, '')) || 0;
+            return parseFloat(String(val).replace(/[+%]/g, '')) || 0;
         };
 
-        stockRows.sort((a, b) => {
+        stockRows.sort(function(a, b) {
             const va = extractNum(sortField, a);
             const vb = extractNum(sortField, b);
             return sortDir === 'asc' ? va - vb : vb - va;
         });
 
-        return summary ? [...stockRows, summary] : stockRows;
+        return summaryObj ? [...stockRows, summaryObj] : stockRows;
     },
 });
 
