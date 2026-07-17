@@ -42,12 +42,8 @@ function extractAccountId(url) {
     return match ? match[1] : null;
 }
 
-// 构建导航 URL
+// 导航到账户汇总页，页面会自动跳转到第一个券商账户的位置页面
 function buildNavigateUrl() {
-    const accountId = getSavedAccountId();
-    if (accountId) {
-        return `https://tzzb.10jqka.com.cn/pc/index.html#/myAccount/a/${accountId}`;
-    }
     return 'https://tzzb.10jqka.com.cn/pc/index.html#/myAccount';
 }
 
@@ -109,8 +105,8 @@ cli({
     strategy: Strategy.COOKIE,
     browser: true,
     userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36',
-    navigateBefore: buildNavigateUrl(),
-    siteSession: 'persistent',
+    navigateBefore: 'https://tzzb.10jqka.com.cn/pc/index.html#/myAccount',
+    siteSession: 'ephemeral',
     defaultFormat: 'md',
     args: [
         { name: 'sortby', type: 'str', default: 'dayprofit', help: '排序字段：value(市值)、dayprofit(当日盈亏)、holdprofit(持有盈亏)、holddays(持有天数)' },
@@ -167,68 +163,67 @@ cli({
             throw new AuthRequiredError('tzzb pos', '未登录。请执行 opencli browser tzzb open https://tzzb.10jqka.com.cn 打开浏览器登录同花顺账号。');
         }
 
-        // 2. 等待表格渲染
-        const ready = await page.evaluate(async () => {
-            for (let i = 0; i < 20; i++) {
-                const el = document.querySelector('#PositionListTableVirtuoso');
-                if (el && el.innerText.includes('持有金额')) return true;
-                await new Promise(r => setTimeout(r, 200));
-            }
-            return false;
-        });
-        if (!ready) {
-            throw new EmptyResultError('tzzb pos', '持仓表格未渲染，请检查页面加载状态');
-        }
+        // 2. 等待页面加载后刷新，然后等待数据加载
+        // 直接 refresh 让页面从第一个券商账户开始加载
+        await page.evaluate(() => location.reload());
+        await page.evaluate(() => new Promise(function(r) { setTimeout(r, 12000); }));
 
-        // 3. 提取数据
-        const rows = await page.evaluate(() => {
-            const table = document.querySelector('#PositionListTableVirtuoso');
-            if (!table) return null;
-            const allText = table.innerText;
-            const lines = allText.split('\n').filter(l => l.trim());
-            if (lines.length < 2) return null;
-            const parsed = [];
-            let current = [];
-            for (const line of lines.slice(1)) {
-                if (/^\d{6}$/.test(line.trim())) {
-                    if (current.length > 0) parsed.push(current);
-                    current = [line.trim()];
-                } else if (line === '汇总') {
-                    if (current.length > 0) parsed.push(current);
-                    current = [line];
+        // 3. 从 body 文本提取持仓数据
+        var rows = await page.evaluate(() => {
+            var docText = document.body.innerText;
+            var idx = docText.indexOf("明细");
+            if (idx < 0) return [];
+            var bodyLines = docText.substring(idx).split("\n")
+                .map(function(l) { return l.trim(); }).filter(Boolean);
+            if (bodyLines.length < 30) return [];
+            var dataPart = bodyLines.slice(28);
+            var result = [];
+            var pos = 0;
+            while (pos < dataPart.length) {
+                var ln = dataPart[pos];
+                if (/^\d{6}/.test(ln)) {
+                    var stock = dataPart.slice(pos, pos + 24);
+                    if (stock.length >= 18) result.push(stock);
+                    pos += 25;
+                } else if (ln === '汇总') {
+                    var sumRow = dataPart.slice(pos, pos + 10);
+                    result.push(sumRow);
+                    break;
                 } else {
-                    current.push(line.trim());
+                    pos++;
                 }
             }
-            if (current.length > 0) parsed.push(current);
-            return parsed;
+            return result;
         });
 
         if (!rows || rows.length < 2) {
-            throw new EmptyResultError('tzzb pos', '未获取到持仓数据，请确认账号已同步持仓');
+            throw new EmptyResultError('tzzb pos', '未获取到持仓数据');
         }
 
-        const dataRows = rows.filter(r => /^\d{6}$/.test(r[0]));
+        var dataRows = rows.filter(function(r) { return /^\d{6}/.test(r[0]); });
         if (dataRows.length === 0) {
             throw new EmptyResultError('tzzb pos', '表格中无股票持仓记录，账户可能为空仓');
         }
 
         // 提取汇总行
-        const summaryRow = rows.find(r => r[0] === '汇总');
+        var summaryRow = null;
+        for (var ri = 0; ri < rows.length; ri++) {
+            if (rows[ri][0] === '汇总') { summaryRow = rows[ri]; break; }
+        }
 
-        // 汇总字段映射
-        const summaryFieldMap = {
-            'code': () => '汇总',
-            'name': () => '',
-            'value': () => fmtNumRaw(summaryRow[1]),
-            'dp': () => mergeProfit(summaryRow[2], summaryRow[3]),
-            'dpr': () => summaryRow[3] || '--',
-            'hp': () => mergeProfit(summaryRow[4], summaryRow[5]),
-            'hpr': () => summaryRow[5] || '--',
-            'hr': () => summaryRow[9] || '--',
-            'hd': () => '--',
-            'cost': () => '--',
-            'price': () => '--',
+        // 汇总字段映射（新页面结构）
+        var summaryFieldMap = {
+            'code': function() { return '汇总'; },
+            'name': function() { return ''; },
+            'value': function() { return fmtNumRaw(summaryRow[1]); },
+            'dp': function() { return mergeProfit(summaryRow[2], summaryRow[3]); },
+            'dpr': function() { return summaryRow[3] || '--'; },
+            'hp': function() { return mergeProfit(summaryRow[4], summaryRow[5]); },
+            'hpr': function() { return summaryRow[5] || '--'; },
+            'hr': function() { return summaryRow[8] || '--'; },
+            'hd': function() { return '--'; },
+            'cost': function() { return '--'; },
+            'price': function() { return '--'; },
         };
 
         // 构建汇总行（根据 data 字段动态构建）
@@ -292,8 +287,8 @@ cli({
     strategy: Strategy.COOKIE,
     browser: true,
     userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36',
-    navigateBefore: buildNavigateUrl(),
-    siteSession: 'persistent',
+    navigateBefore: 'https://tzzb.10jqka.com.cn/pc/index.html#/myAccount',
+    siteSession: 'ephemeral',
     func: async (page, args) => {
         console.log('正在刷新页面...');
         
@@ -304,29 +299,45 @@ cli({
             saveAccountId(accountId);
         }
         
-        // 使用 JavaScript 在页面上下文中刷新
+        // 刷新页面
         await page.evaluate(() => location.reload());
-        // 在页面上下文中等待
-        await page.evaluate(() => new Promise(r => setTimeout(r, 3000)));
-        
-        // 等待表格加载完成
-        const ready = await page.evaluate(async () => {
-            for (let i = 0; i < 20; i++) {
-                const el = document.querySelector('#PositionListTableVirtuoso');
-                if (el && el.innerText.includes('持有金额')) return true;
-                await new Promise(r => setTimeout(r, 200));
+        await page.evaluate(() => new Promise(function(r) { setTimeout(r, 4000); }));
+        // 点击券商标签加载数据
+        await page.evaluate(() => {
+            var allEls = document.querySelectorAll('*');
+            var after = false;
+            for (var j = 0; j < allEls.length; j++) {
+                var el = allEls[j];
+                if (!after) {
+                    if (el.children.length === 0 && el.textContent.trim() === '汇总持仓') {
+                        after = true;
+                    }
+                    continue;
+                }
+                if (el.children.length === 0) {
+                    var t = el.textContent.trim();
+                    if (/^[\u4e00-\u9fa5]{2,4}$/.test(t) && t !== '自选' && t !== '我的账户') {
+                        el.click();
+                        break;
+                    }
+                }
             }
-            return false;
+        });
+        await page.evaluate(() => new Promise(function(r) { setTimeout(r, 5000); }));
+        
+        var ready = await page.evaluate(function() {
+            var txt = document.body.innerText;
+            return txt.indexOf('明细') >= 0 && txt.indexOf('920') >= 0;
         });
         
         if (ready) {
             return { 
                 status: 'success', 
-                message: '✅ 页面刷新成功，数据已更新',
+                message: '页面刷新成功',
                 timestamp: new Date().toLocaleString('zh-CN')
             };
         } else {
-            throw new EmptyResultError('tzzb reload', '页面刷新后数据未加载，请检查网络或重新登录');
+            throw new EmptyResultError('tzzb reload', '页面刷新后数据未加载');
         }
     },
 });
