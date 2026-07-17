@@ -98,9 +98,9 @@ const fieldDefs = {
 cli({
     site: 'tzzb',
     name: 'pos',
-    description: '获取持仓汇总：股票代码、名称、市值、当日盈亏(率)、持有盈亏(率)、仓位占比、持仓数、持有天数、成本/现价。默认输出：代码、名称、当日盈亏、当日盈亏率、持仓市值、持仓比例。其余字段可通过 --data 参数配置。首次使用需登录，账户 ID 会自动保存。',
+    description: '获取持仓汇总。支持多账户切换(--account)，支持排序(--sortby/--sort)和自定义输出字段(--data)。默认展示汇总持仓。可用 opencli tzzb accounts 查看所有券商账户。',
     access: 'read',
-    example: 'opencli tzzb pos [--sortby value] [--sort des] [--data code,name,dp,dpr,value,hr]',
+    example: 'opencli tzzb pos [--account 银河] [--sortby value] [--sort des] [--data code,name,dp,dpr,value,hr]',
     domain: SITE,
     strategy: Strategy.COOKIE,
     browser: true,
@@ -118,6 +118,7 @@ cli({
             help: '输出字段（逗号分隔）：code(代码)、name(名称)、value(持仓市值)、dp(当日盈亏)、dpr(当日盈亏率)、hp(持有盈亏)、hpr(持有盈亏率)、hd(持有天数)、hr(仓位占比)、cost(成本)、price(现价)。默认输出：code,name,dp,dpr,value,hr'
         },
         { name: 'refresh', type: 'bool', default: false, help: '查询前刷新页面以获取最新数据' },
+        { name: 'account', type: 'str', default: '', help: '选择券商账户：汇总持仓、银河国金、小远银河、小远华鑫、小远东莞、华泰、蚂蚁财富、爱基金。为空时默认显示汇总持仓' },
     ],
     columns: dynamicColumns,
     func: async (page, args) => {
@@ -150,25 +151,44 @@ cli({
         };
         const sortField = sortFieldMap[sortby] || '当日盈亏';
 
-        // 1. 快速鉴权检查 + 账户 ID 保存
+        // 1. 快速鉴权检查
         const url = await page.evaluate(() => window.location.href);
-        
-        // 检测并保存账户 ID
-        const accountId = extractAccountId(url);
-        if (accountId && accountId !== getSavedAccountId()) {
-            saveAccountId(accountId);
-        }
-        
         if (url.includes('login') || url.includes('auth')) {
             throw new AuthRequiredError('tzzb pos', '未登录。请执行 opencli browser tzzb open https://tzzb.10jqka.com.cn 打开浏览器登录同花顺账号。');
         }
 
         // 2. 等待页面加载后刷新，然后等待数据加载
-        // 直接 refresh 让页面从第一个券商账户开始加载
         await page.evaluate(() => location.reload());
-        await page.evaluate(() => new Promise(function(r) { setTimeout(r, 12000); }));
+        await page.evaluate(() => new Promise(function(r) { setTimeout(r, 8000); }));
 
-        // 3. 从 body 文本提取持仓数据
+        // 3. 选择指定券商账户
+        // 默认不点击任何标签 = 汇总持仓（显示所有绑定券商的总持仓）
+        var acctName = (args.account || '').trim();
+        if (acctName && acctName !== '汇总持仓') {
+            var idx = await page.evaluate(function(name) {
+                var tabBar = document.querySelector('.SumAccountTab_listView');
+                if (!tabBar) return -1;
+                var items = tabBar.querySelectorAll('div > div');
+                for (var j = 0; j < items.length; j++) {
+                    if (items[j].textContent.trim() === name) return j;
+                }
+                return -1;
+            }, acctName);
+            if (idx >= 0) {
+                var selector = '.SumAccountTab_listView > div:nth-child(' + (idx + 1) + ')';
+                try { await page.click(selector); } catch(e) {
+                    await page.evaluate(function(s) {
+                        var el = document.querySelector(s);
+                        if (el) el.click();
+                    }, selector);
+                }
+            } else {
+                console.log('⚠️ 未找到账户 "' + acctName + '"，请检查账户名称是否正确（可用 opencli tzzb accounts 查看可用账户）');
+            }
+            await page.evaluate(function() { return new Promise(function(r) { setTimeout(r, 5000); }); });
+        }
+
+        // 4. 从 body 文本提取持仓数据
         var rows = await page.evaluate(() => {
             var docText = document.body.innerText;
             var idx = docText.indexOf("明细");
@@ -277,7 +297,7 @@ cli({
     },
 });
 
-// 独立刷新命令
+// 独立刷新命令（重新加载最新数据）
 cli({
     site: 'tzzb',
     name: 'reload',
@@ -289,56 +309,24 @@ cli({
     userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36',
     navigateBefore: 'https://tzzb.10jqka.com.cn/pc/index.html#/myAccount',
     siteSession: 'ephemeral',
-    func: async (page, args) => {
-        console.log('正在刷新页面...');
-        
-        // 检测并保存账户 ID
-        const url = await page.evaluate(() => window.location.href);
-        const accountId = extractAccountId(url);
-        if (accountId && accountId !== getSavedAccountId()) {
-            saveAccountId(accountId);
-        }
-        
-        // 刷新页面
+    func: async (page) => {
+        console.log('正在刷新数据...');
         await page.evaluate(() => location.reload());
-        await page.evaluate(() => new Promise(function(r) { setTimeout(r, 4000); }));
-        // 点击券商标签加载数据
-        await page.evaluate(() => {
-            var allEls = document.querySelectorAll('*');
-            var after = false;
-            for (var j = 0; j < allEls.length; j++) {
-                var el = allEls[j];
-                if (!after) {
-                    if (el.children.length === 0 && el.textContent.trim() === '汇总持仓') {
-                        after = true;
-                    }
-                    continue;
-                }
-                if (el.children.length === 0) {
-                    var t = el.textContent.trim();
-                    if (/^[\u4e00-\u9fa5]{2,4}$/.test(t) && t !== '自选' && t !== '我的账户') {
-                        el.click();
-                        break;
-                    }
-                }
-            }
-        });
-        await page.evaluate(() => new Promise(function(r) { setTimeout(r, 5000); }));
+        await page.evaluate(() => new Promise(function(r) { setTimeout(r, 10000); }));
         
         var ready = await page.evaluate(function() {
             var txt = document.body.innerText;
-            return txt.indexOf('明细') >= 0 && txt.indexOf('920') >= 0;
+            return txt.indexOf('明细') >= 0 && txt.length > 600;
         });
         
         if (ready) {
             return { 
                 status: 'success', 
-                message: '页面刷新成功',
+                message: '数据已更新',
                 timestamp: new Date().toLocaleString('zh-CN')
             };
-        } else {
-            throw new EmptyResultError('tzzb reload', '页面刷新后数据未加载');
         }
+        throw new EmptyResultError('tzzb reload', '刷新后数据未加载');
     },
 });
 
@@ -439,4 +427,48 @@ cli({
             };
         }
     },
+});
+
+// 列出页面上的可用券商账户
+cli({
+    site: 'tzzb',
+    name: 'accounts',
+    description: '列出当前登录账户下可用的券商账户标签',
+    access: 'read',
+    domain: SITE,
+    strategy: Strategy.COOKIE,
+    browser: true,
+    navigateBefore: 'https://tzzb.10jqka.com.cn/pc/index.html#/myAccount',
+    siteSession: 'ephemeral',
+    defaultFormat: 'md',
+    columns: ['券商账户'],
+    func: async (page) => {
+        var accts = await page.evaluate(function() {
+            var all = document.querySelectorAll('*');
+            var seen = {};
+            var result = [];
+            for (var j = 0; j < all.length; j++) {
+                var el = all[j];
+                if (el.children.length === 0) {
+                    var t = el.textContent.trim();
+                    if (/^[\u4e00-\u9fa5]{2,6}$/.test(t) && 
+                        ['首页','数据导入','添加','总资产','当日盈亏','本月盈亏','今年盈亏','仓位',
+                         '盈亏对比','胜率对比','组合穿透','明细','代码','名称','持有金额',
+                         '关联板块','板块涨幅','组合盈亏','组合涨幅','昨日盈亏','昨日盈亏率',
+                         '持有盈亏','持有盈亏率','累计盈亏','累计盈亏率','本周盈亏','本月盈亏','今年盈亏',
+                         '仓位占比','持有数量','持仓天数','确认涨幅','确认净值','单位成本','回本涨幅',
+                         '近1月涨幅','近3月涨幅','近6月涨幅','近1年涨幅',
+                         '持仓列表','交易记录','数据导出','持仓管理',
+                         '创业板指','上证指数','深证指数'].indexOf(t) < 0) {
+                        if (!seen[t]) {
+                            seen[t] = true;
+                            result.push(t);
+                        }
+                    }
+                }
+            }
+            return result;
+        });
+        return accts.map(function(a) { return { '券商账户': a }; });
+    }
 });
