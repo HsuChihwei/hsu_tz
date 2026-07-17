@@ -157,9 +157,8 @@ cli({
             throw new AuthRequiredError('tzzb pos', '未登录。请执行 opencli browser tzzb open https://tzzb.10jqka.com.cn 打开浏览器登录同花顺账号。');
         }
 
-        // 2. 等待页面加载后刷新，然后等待数据加载
-        await page.evaluate(() => location.reload());
-        await page.evaluate(() => new Promise(function(r) { setTimeout(r, 8000); }));
+        // 2. 等待 SPA 数据加载完成
+        await page.evaluate(() => new Promise(function(r) { setTimeout(r, 3000); }));
 
         // 3. 选择指定券商账户（默认汇总持仓，需显式点击以确保选中）
         var targetTab = (args.account || '').trim() || '汇总持仓';
@@ -188,33 +187,54 @@ cli({
         }
         await page.evaluate(function() { return new Promise(function(r) { setTimeout(r, 5000); }); });
 
-        // 4. 从 body 文本提取持仓数据
-        var rows = await page.evaluate(() => {
-            var docText = document.body.innerText;
-            var idx = docText.indexOf("明细");
-            if (idx < 0) return [];
-            var bodyLines = docText.substring(idx).split("\n")
-                .map(function(l) { return l.trim(); }).filter(Boolean);
-            if (bodyLines.length < 30) return [];
-            var dataPart = bodyLines.slice(28);
-            var result = [];
-            var pos = 0;
-            while (pos < dataPart.length) {
-                var ln = dataPart[pos];
-                if (/^\d{6}/.test(ln)) {
-                    var stock = dataPart.slice(pos, pos + 24);
-                    if (stock.length >= 18) result.push(stock);
-                    pos += 25;
-                } else if (ln === '汇总') {
-                    var sumRow = dataPart.slice(pos, pos + 10);
-                    result.push(sumRow);
-                    break;
-                } else {
-                    pos++;
+        // 4. 分段滚动捕获所有持仓（虚拟滚动只渲染可见行，需逐段收集去重）
+        var allRows = await page.evaluate(async function() {
+            var seenCodes = {};
+            var allResults = [];
+            var viewportH = window.innerHeight;
+            var maxScroll = document.body.scrollHeight;
+            for (var step = 0; step < 50; step++) {
+                window.scrollTo(0, step * viewportH * 0.8);
+                await new Promise(function(r) { setTimeout(r, 400); });
+                // 从当前 body 文本提取可见的股票行
+                var docText = document.body.innerText;
+                var idx = docText.indexOf("明细");
+                if (idx < 0) continue;
+                var lines = docText.substring(idx).split("\n").map(function(l){return l.trim()}).filter(Boolean);
+                var dataStart = 0;
+                for (var s = 0; s < lines.length; s++) {
+                    if (/^\d{6}/.test(lines[s])) { dataStart = s; break; }
                 }
+                if (dataStart === 0) continue;
+                var dataPart = lines.slice(dataStart);
+                var pos = 0;
+                while (pos < dataPart.length) {
+                    var ln = dataPart[pos];
+                    if (/^\d{6}/.test(ln)) {
+                        var code = ln;
+                        if (!seenCodes[code]) {
+                            seenCodes[code] = true;
+                            var stock = dataPart.slice(pos, pos + 25);
+                            if (stock.length >= 18) allResults.push(stock);
+                        }
+                        pos += 25;
+                    } else if (ln === '汇总') {
+                        var sumRow = dataPart.slice(pos, pos + 10);
+                        allResults.push(sumRow);
+                        pos = dataPart.length;
+                        break;
+                    } else {
+                        pos++;
+                    }
+                }
+                if (step * viewportH * 0.8 >= maxScroll) break;
             }
-            return result;
+            window.scrollTo(0, 0);
+            return allResults;
         });
+
+        // 5. 使用逐段收集的完整持仓数据
+        var rows = allRows;
 
         if (!rows || rows.length < 2) {
             throw new EmptyResultError('tzzb pos', '未获取到持仓数据');
