@@ -161,32 +161,32 @@ cli({
         await page.evaluate(() => location.reload());
         await page.evaluate(() => new Promise(function(r) { setTimeout(r, 8000); }));
 
-        // 3. 选择指定券商账户
-        // 默认不点击任何标签 = 汇总持仓（显示所有绑定券商的总持仓）
-        var acctName = (args.account || '').trim();
-        if (acctName && acctName !== '汇总持仓') {
-            var idx = await page.evaluate(function(name) {
-                var tabBar = document.querySelector('.SumAccountTab_listView');
-                if (!tabBar) return -1;
-                var items = tabBar.querySelectorAll('div > div');
-                for (var j = 0; j < items.length; j++) {
-                    if (items[j].textContent.trim() === name) return j;
-                }
-                return -1;
-            }, acctName);
-            if (idx >= 0) {
-                var selector = '.SumAccountTab_listView > div:nth-child(' + (idx + 1) + ')';
-                try { await page.click(selector); } catch(e) {
-                    await page.evaluate(function(s) {
-                        var el = document.querySelector(s);
-                        if (el) el.click();
-                    }, selector);
-                }
-            } else {
-                console.log('⚠️ 未找到账户 "' + acctName + '"，请检查账户名称是否正确（可用 opencli tzzb accounts 查看可用账户）');
+        // 3. 选择指定券商账户（默认汇总持仓，需显式点击以确保选中）
+        var targetTab = (args.account || '').trim() || '汇总持仓';
+        var idx = await page.evaluate(function(name) {
+            var tabBar = document.querySelector('.SumAccountTab_listView');
+            if (!tabBar) return -1;
+            var items = tabBar.querySelectorAll('div > div');
+            for (var j = 0; j < items.length; j++) {
+                if (items[j].textContent.trim() === name) return j;
             }
-            await page.evaluate(function() { return new Promise(function(r) { setTimeout(r, 5000); }); });
+            return -1;
+        }, targetTab);
+        if (idx >= 0) {
+            var selector = '.SumAccountTab_listView > div:nth-child(' + (idx + 1) + ')';
+            try { await page.click(selector); } catch(e) {
+                await page.evaluate(function(s) {
+                    var el = document.querySelector(s);
+                    if (el) {
+                        var evt = new MouseEvent('click', {bubbles:true, cancelable:true, view:window});
+                        el.dispatchEvent(evt);
+                    }
+                }, selector);
+            }
+        } else {
+            console.log('⚠️ 未找到账户 "' + targetTab + '"');
         }
+        await page.evaluate(function() { return new Promise(function(r) { setTimeout(r, 5000); }); });
 
         // 4. 从 body 文本提取持仓数据
         var rows = await page.evaluate(() => {
